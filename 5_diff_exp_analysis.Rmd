@@ -1,0 +1,1359 @@
+---
+title: "sheep_ovarian_RNAseq"
+author: "John Dou"
+date: "August 21, 2019"
+output: html_document
+---
+
+## Load and install (if needed) libraries
+
+```{r lib, echo=TRUE, results='hide', message=F, warning=F, include=FALSE}
+library(DESeq2)
+library(ggplot2)
+library(EnhancedVolcano)
+library(grid)
+library(gridExtra)
+library(gridGraphics)
+library(magrittr)
+```
+
+
+## Meta data setup and load counts
+
+Load table of counts per gene from featureCount output and meta data. 
+
+Set data.dir to where files are located.
+
+```{r files}
+data.dir <- "F:/Drive/Misc/RNAseq/Sheep_RNAseq/Sheep_Ov/Data"
+save.dir <- "F:/Drive/Misc/RNAseq/Sheep_RNAseq/Sheep_Ov/Results"
+
+counts <- read.table(file.path(data.dir,"counts"), header=T)
+gene_info <- counts[,1:6]
+counts <- counts[,7:26]
+names(counts) <- gsub('.*\\STAR.|\\.Aligned.*','',names(counts))
+rownames(counts) <- gene_info$Geneid
+
+meta <- read.table(file.path(data.dir,"Run_2823_padmanabha_DemuxStats.txt"), header = T)
+
+#get treatment group from the sample names
+meta <- meta[1:20,]
+meta$id2 <- paste0("Sample_",meta$SampleID)
+meta$Description <- as.character(meta$Description)
+meta$treat <- c('C','C','C','C','C','T','T','T','T','T',
+                'C','C','C','C','C','T','T','T','T','T')
+meta$sheep <- factor(substr(meta$Description,1,3))
+meta$tissue <- factor(substr(meta$Description,4,5))
+meta$group <- factor(paste0(meta$treat,"_", meta$tissue))
+
+# #isolate sample ids
+# ids <- unique(meta[,'Description'])
+# write.csv(data.frame(ids), file=file.path(data.dir,'sample_ids.csv'), row.names=F)
+```
+
+
+## Loading into DESeq2
+
+
+```{r}
+#order meta data same as count matrix
+identical(names(counts),meta$id2)
+counts <- counts[,match(meta$id2,names(counts))]
+identical(names(counts),meta$id2)
+
+#make deseq object
+deseq.ds <- DESeqDataSetFromMatrix(countData = counts,
+                                    colData = meta,
+                                    design = ~ group)
+```
+
+
+## Construct Descriptive Table 1
+```{r}
+tab1 <- meta[,c("SampleID", "sheep", "tissue", "treat")]
+
+### collapse read counts for supp table 1
+rownames(summ) <- summ$Status
+summ <- summ[,-1]
+summ <- summ[,as.character(pd$unique.ID)]
+summ <- data.frame(t(summ))
+summ$samp <- pd$sample.ID
+n_reads <- summ %>%
+  group_by(samp) %>%
+  summarise(reads=sum(Assigned))
+
+tab1 <- n_reads
+
+#get number reads
+summ <- read.table(file.path(data.dir,"counts.summary"), header=T)
+names(summ) <- gsub('.*STAR.','',names(summ))
+names(summ) <- gsub('.Aligned.out.sorted','',names(summ))
+reads <- summ[1,-1]
+identical(names(reads),paste0('Sample_',as.character(tab1$SampleID)))
+reads <- reads[paste0('Sample_',as.character(tab1$SampleID))]
+identical(names(reads),paste0('Sample_',as.character(tab1$SampleID)))
+tab1$reads <- as.numeric(reads)
+
+#compute n genes from counts
+n_genes <- colSums(counts(deseq.ds)>0)
+identical(names(n_genes),paste0('Sample_',as.character(tab1$SampleID)))
+tab1$genes <- n_genes
+
+tab1$group <- paste0(tab1$tissue,tab1$treat)
+summary(aov(reads~group,data=tab1))
+t.test(reads~tissue,data=tab1)
+t.test(reads~treat,data=tab1)
+
+summary(aov(genes~group,data=tab1))
+t.test(genes~tissue,data=tab1)
+t.test(genes~treat,data=tab1)
+
+write.csv(tab1, file=file.path(save.dir,"table1.csv"))
+```
+
+
+## PCA Plots
+```{r}
+#PCA plot
+vsd <- vst(deseq.ds)
+
+pca.treat <- plotPCA(vsd, "treat") + 
+  scale_color_discrete(name='Treatment', labels=c('Control','Prenatal\nTestosterone')) +
+  theme(axis.text=element_text(size=16),
+        axis.title=element_text(size=18),
+        legend.title=element_text(size=14),
+        legend.text=element_text(size=12)) +
+  geom_point(size=4)
+
+pca.tissue <- plotPCA(vsd, "tissue") + 
+  scale_color_discrete(name='Cell Type', labels=c('Granulosa','Theca')) +
+  theme(axis.text=element_text(size=16),
+        axis.title=element_text(size=18),
+        legend.title=element_text(size=14),
+        legend.text=element_text(size=12)) +
+  geom_point(size=4)
+
+pca.sheep <- plotPCA(vsd, "sheep") + 
+  scale_color_discrete(name='Sheep ID') +
+  theme(axis.text=element_text(size=16),
+        axis.title=element_text(size=18),
+        legend.title=element_text(size=14),
+        legend.text=element_text(size=12)) +
+  geom_point(size=4)
+
+pca.grp <- plotPCA(vsd, "group") + 
+  scale_color_discrete(name='Group', labels=c("Granusola Control", "Theca Control", "Granusola Treat", "Theca Treat")) +
+  theme(axis.text=element_text(size=16),
+        axis.title=element_text(size=18),
+        legend.title=element_text(size=14),
+        legend.text=element_text(size=12)) +
+  geom_point(size=4)
+
+
+getPCs = function(object, intgroup="condition", ntop=500)
+{
+  # calculate the variance for each gene
+  rv <- rowVars(assay(object))
+
+  # select the ntop genes by variance
+  select <- order(rv, decreasing=TRUE)[seq_len(min(ntop, length(rv)))]
+
+  # perform a PCA on the data in assay(x) for the selected genes
+  pca <- prcomp(t(assay(object)[select,]))
+
+  # the contribution to the total variance for each component
+  percentVar <- pca$sdev^2 / sum( pca$sdev^2 )
+
+  if (!all(intgroup %in% names(colData(object)))) {
+    stop("the argument 'intgroup' should specify columns of colData(dds)")
+  }
+
+  intgroup.df <- as.data.frame(colData(object)[, intgroup, drop=FALSE])
+  
+  # add the intgroup factors together to create a new grouping factor
+  group <- if (length(intgroup) > 1) {
+    factor(apply( intgroup.df, 1, paste, collapse=":"))
+  } else {
+    colData(object)[[intgroup]]
+  }
+
+  # assembly the data for the plot
+  d <- data.frame(pca$x, group=group, intgroup.df, name=colnames(object))
+
+  attr(d, "percentVar") <- percentVar
+  return(d)
+
+}
+
+pcs <- getPCs(vsd, "group")
+
+pc_2_3 <- ggplot(data=pcs, aes_string(x="PC2", y="PC3", color="group")) + geom_point(size=3) + 
+    xlab(paste0("PC2: ",round(attr(pcs,'percentVar')[2] * 100),"% variance")) +
+      ylab(paste0("PC3: ",round(attr(pcs,'percentVar')[3] * 100),"% variance")) +
+        coord_fixed() + 
+  scale_color_discrete(name='Group') +
+  theme(axis.text=element_text(size=16),
+        axis.title=element_text(size=18),
+        legend.title=element_text(size=14),
+        legend.text=element_text(size=12)) +
+  geom_point(size=4)
+
+
+### what if we remove outlier sheep?
+no_outlier <- deseq.ds[,deseq.ds$sheep != 209]
+vsd_noout <- vst(no_outlier)
+
+pcs.grp <- plotPCA(vsd_noout, "group", returnData=TRUE)
+pca.grp.out <- ggplot(pcs.grp, aes(x=PC1, y=PC2, group=group)) + 
+  geom_point(size=4, stroke=1.4, aes(shape=group, col=group)) +
+  theme(axis.text=element_text(size=16),
+        axis.title=element_text(size=18),
+        legend.title=element_text(size=14),
+        legend.text=element_text(size=12),
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        axis.line = element_line(size=0.5)) +
+  xlab("PC1: 65% variance") + ylab("PC2: 16% variance") +
+  scale_shape_manual(name='Group', labels=c("Granusola Control", "Theca Control", "Granusola Prenatal T", "Theca Prenatal T"),
+                     values=c(1,1,16,16)) +
+  scale_color_manual(name='Group', labels=c("Granusola Control", "Theca Control", "Granusola Prenatal T", "Theca Prenatal T"), 
+                                            values=c("#960101", "#0968BB", "#960101", "#0968BB"))
+  
+
+library(colorspace)
+library(scales)
+library(RColorBrewer)
+sheep.cols <- brewer.pal(9,'Set1')
+sheep.cols[6] <- darken(sheep.cols[6] , amount=0.12) 
+show_col(sheep.cols)
+pcs.sheep <- plotPCA(vsd_noout, "sheep", returnData=TRUE)
+pca.sheep.out <- ggplot(pcs.sheep, aes(x=PC1, y=PC2, group=sheep)) + 
+  geom_point(size=4, aes(col=sheep)) +
+  theme(axis.text=element_text(size=16),
+        axis.title=element_text(size=18),
+        legend.title=element_text(size=14),
+        legend.text=element_text(size=12),
+        panel.background = element_blank(),
+        panel.grid = element_blank(),
+        axis.line = element_line(size=0.5)) +
+  xlab("PC1: 65% variance") + ylab("PC2: 16% variance") +
+  scale_color_manual(name='Sheep ID',values=sheep.cols)
+
+
+
+### Supplemental Figure 1
+
+pdf(file.path(save.dir,'PCA_plot.pdf'))
+pca.sheep.out
+pca.grp.out
+dev.off()
+
+ggsave(pca.grp.out, file=file.path(save.dir,'SuppFig_PCA_group.svg'), height=4, width=7)
+ggsave(pca.sheep.out, file=file.path(save.dir,'SuppFig_PCA_sheep.svg'), height=4, width=6)
+
+
+
+rm(vsd)
+
+```
+
+
+## Remove the outlier sheep?
+
+set TRUE if outlier sheep identified in pc plots is to be removed from analysis
+```{r outRemove}
+REMOVE <- TRUE
+
+if(REMOVE){
+  deseq.ds <- deseq.ds[,deseq.ds$sheep != 209]
+  deseq.ds$sheep <- factor(deseq.ds$sheep) 
+  #res <- "C:/Users/John/Google Drive/Misc/RNAseq/Sheep_RNAseq/Sheep_Ov/Results/Outlier Removed"
+  res <- "F:/Drive/Misc/RNAseq/Sheep_RNAseq/Sheep_Ov/Results/Outlier Removed"
+}else{
+  res <- "C:/Users/John/Google Drive/Misc/RNAseq/Sheep_RNAseq/Sheep_Ov/Results/With Outlier"
+}
+
+```
+
+
+```{r tissue}
+
+#set up DESeq object for model
+comp_tissue <- deseq.ds
+comp_tissue <- comp_tissue[,comp_tissue$treat=='C']
+comp_tissue$sheep <- factor(comp_tissue$sheep)
+design(comp_tissue) <- ~tissue + sheep
+
+#fit model
+tissue_fit <- DESeq(comp_tissue)
+
+#what are coefficient names
+resultsNames(tissue_fit)
+
+#get results
+tissue_res <- results(tissue_fit, name="tissue_TC_vs_GC")
+head(tissue_res)
+
+
+#filtered for any reason
+table(is.na(tissue_res$padj)) 
+
+#all sample count zero
+table(tissue_res$baseMean==0) 
+
+#independent filtering for low normalized mean counts
+table(!is.na(tissue_res$pvalue) & is.na(tissue_res$padj)) 
+
+#count outlier by Cook's distance
+table(!is.na(tissue_res$log2FoldChange) & is.na(tissue_res$pvalue) & is.na(tissue_res$padj)) 
+
+
+shrink_tissue <- lfcShrink(tissue_fit, coef="tissue_TC_vs_GC", res=tissue_res, type='apeglm')
+shrink_tissue <- shrink_tissue[!is.na(shrink_tissue$padj),]
+vol_cell <- EnhancedVolcano(shrink_tissue, 
+                title='',
+                subtitle='',
+                caption='',
+                titleLabSize = 0,
+                subtitleLabSize = 0,
+                captionLabSize = 0,
+                lab=rownames(shrink_tissue), 
+                selectLab=c('CYP17A1','CYP19','IHH','ACTA2','PRELP','MYLK','NLRP8','WWE2','LTB4R2','LOC114108842','COL1A1'),
+                x='log2FoldChange',
+                y='padj',
+                ylab = bquote(~-Log[10]~adjusted~italic(P)),
+                xlim = c(NA,10.0),
+                ylim = c(0,300),
+                legendVisible = F,
+                pCutoff=0.05,
+                #FCcutoff=2.5,
+                transcriptLabSize = 3.5,
+                transcriptPointSize = 1.8,
+                drawConnectors = T,
+                transcriptLabFace = 'italic',
+                colAlpha = 1)  +
+  theme(plot.margin = unit(c(1,8,2,1),"lines"), panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.line = element_line(size=0.5)) +
+  coord_cartesian(clip="off") +
+  annotation_custom(textGrob("Greater Expression \nin Granulosa"), xmin=-7, xmax=-7, ymin=-130, ymax=-130) +
+  annotation_custom(textGrob("Greater Expression \nin Theca"), xmin=7, xmax=7, ymin=-130, ymax=-130)
+
+vol_cell
+
+ggsave(vol_cell, file=file.path(res,'figure2A_volcano_cell_type.svg'), height=5, width=7)
+
+shrink_tissue <- shrink_tissue[order(shrink_tissue$padj),]
+write.csv(shrink_tissue,file.path(res,"DE genes tissue.csv"))
+
+
+# some counts of thresholds
+table(shrink_tissue$padj<0.05)
+table(abs(shrink_tissue$log2FoldChange)>1)
+table(abs(shrink_tissue$log2FoldChange)>1 & shrink_tissue$padj<0.05)
+
+head(shrink_tissue)
+head(shrink_tissue[order(-abs(shrink_tissue$log2FoldChange)),])
+
+#mean per cell type
+counts <- counts(tissue_fit, normalized=T)
+meta <- colData(tissue_fit)
+identical(colnames(counts),rownames(meta))
+baseMean_GC <- rowMeans(counts[,meta$tissue=='GC'])
+baseMean_TC <- rowMeans(counts[,meta$tissue=='TC'])
+
+shrink_tissue$baseMean_GC <- baseMean_GC[rownames(shrink_tissue)] 
+shrink_tissue$baseMean_TC <- baseMean_TC[rownames(shrink_tissue)] 
+
+shrink_tissue <- shrink_tissue[,c(6,7,2:5)]
+write.csv(shrink_tissue,file.path(res,"DE genes cell controls.csv"))
+
+
+
+
+
+
+
+
+
+### comparison in prenatal t
+
+#set up DESeq object for model
+comp_tissue_t <- deseq.ds
+comp_tissue_t <- comp_tissue_t[,comp_tissue_t$treat=='T']
+comp_tissue_t$sheep <- factor(comp_tissue_t$sheep)
+design(comp_tissue_t) <- ~tissue + sheep
+
+#fit model
+tissue_t_fit <- DESeq(comp_tissue_t)
+
+#what are coefficient names
+resultsNames(tissue_t_fit)
+
+#get results
+tissue_t_res <- results(tissue_t_fit, name="tissue_TC_vs_GC")
+head(tissue_t_res)
+
+#filtering summary
+summary(tissue_t_res)
+
+shrink_tissue_t <- lfcShrink(tissue_t_fit, coef="tissue_TC_vs_GC", res=tissue_t_res, type='apeglm')
+
+shrink_tissue_t <- shrink_tissue_t[!is.na(shrink_tissue_t$padj),]
+vol_cell_t <- EnhancedVolcano(shrink_tissue_t, 
+                title='',
+                subtitle='',
+                caption='',
+                titleLabSize = 0,
+                subtitleLabSize = 0,
+                captionLabSize = 0,
+                lab=rownames(shrink_tissue_t), 
+                selectLab=c('CYP17A1','CYP19','IHH','ACTA2','PRELP','MYLK','NLRP8','WWE2','LTB4R2','LOC114108842','COL1A1'),
+                x='log2FoldChange',
+                y='padj',
+                ylab = bquote(~-Log[10]~adjusted~italic(P)),
+                xlim = c(NA,10.0),
+                ylim = c(0,300),
+                legendVisible = F,
+                pCutoff=0.05,
+                #FCcutoff=2.5,
+                transcriptLabSize = 3.5,
+                transcriptPointSize = 1.8,
+                drawConnectors = T,
+                colAlpha = 1)  +
+  theme(plot.margin = unit(c(1,8,2,1),"lines"), panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.line = element_line(size=0.5)) +
+  coord_cartesian(clip="off") +
+  annotation_custom(textGrob("Greater Expression \nin Granulosa"), xmin=-7, xmax=-7, ymin=-130, ymax=-130) +
+  annotation_custom(textGrob("Greater Expression \nin Theca"), xmin=7, xmax=7, ymin=-130, ymax=-130)
+
+vol_cell_t
+
+#mean per cell type
+counts <- counts(tissue_t_fit, normalized=T)
+meta <- colData(tissue_t_fit)
+identical(colnames(counts),rownames(meta))
+baseMean_GC <- rowMeans(counts[,meta$tissue=='GC'])
+baseMean_TC <- rowMeans(counts[,meta$tissue=='TC'])
+
+shrink_tissue_t$baseMean_GC <- baseMean_GC[rownames(shrink_tissue_t)] 
+shrink_tissue_t$baseMean_TC <- baseMean_TC[rownames(shrink_tissue_t)] 
+
+shrink_tissue_t <- shrink_tissue_t[order(shrink_tissue_t$padj),]
+shrink_tissue_t <- shrink_tissue_t[,c(6,7,2:5)]
+write.csv(shrink_tissue_t,file.path(res,"DE genes cell prenatalT.csv"))
+
+```
+
+
+
+
+```{r t_gc}
+
+#fit model
+treat_gc_fit <- DESeq(deseq.ds)
+
+#what are coefficient names
+resultsNames(treat_gc_fit)
+
+#get results
+treat_gc_res <- results(treat_gc_fit, name="group_T_GC_vs_C_GC")
+head(treat_gc_res)
+
+#filtered for any reason
+table(is.na(treat_gc_res$padj)) 
+
+#all sample count zero
+table(treat_gc_res$baseMean==0) 
+
+#independent filtering for low normalized mean counts
+table(!is.na(treat_gc_res$pvalue) & is.na(treat_gc_res$padj)) 
+
+#count outlier by Cook's distance
+table(!is.na(treat_gc_res$log2FoldChange) & is.na(treat_gc_res$pvalue) & is.na(treat_gc_res$padj)) 
+
+c('FGD5','COL1A2','LOC114117578','ADGRL3','DUSP26','CCDC69','CHI3L1')
+c(1.1, 0, 0.1, 1.1, 0.5, 0.5, 0)
+c(0, -0.5, -1.0, 0.2, -0.5, -0.5, 0)
+
+c('COL1A2','CCDC69','ADGRL3','CHI3L1','LOC114117578','FGD5','DUSP26')
+c(0, 0.5, 1.1, 0, 0.1, 1.1, 0.5)
+c(-0.5, -0.5, 0.2, 0, -1.0, 0, -0.5)
+
+shrink_treat_gc <- lfcShrink(treat_gc_fit, coef="group_T_GC_vs_C_GC", res=treat_gc_res, type='apeglm')
+shrink_treat_gc <- shrink_treat_gc[!is.na(shrink_treat_gc$padj),]
+vol_gc <- EnhancedVolcano(shrink_treat_gc, 
+                title='',
+                subtitle='',
+                caption='',
+                titleLabSize = 0,
+                subtitleLabSize = 0,
+                captionLabSize = 0,
+                lab=rownames(shrink_treat_gc), 
+                selectLab=c('FGD5','COL1A2','LOC114117578','ADGRL3','DUSP26','CCDC69','CHI3L1'),
+                x='log2FoldChange',
+                y='padj',
+                ylab = bquote(~-Log[10]~adjusted~italic(P)),
+                #xlim = c(-4.5,6.0),
+                ylim = c(0,10),
+                legendVisible = F,
+                pCutoff=0.05,
+                #FCcutoff=2.5,
+                transcriptLabSize = 3.5,
+                transcriptLabhjust = c(0, 0.5, 1.1, 0, 0.1, 1.1, 0.5),
+                transcriptLabvjust = c(-0.5, -0.5, 0.2, 0, -1.0, 0, -0.5),
+                #drawConnectors = TRUE,
+                #colConnectors = rgb(0,0,0,0, maxColorValue=255),
+                transcriptLabFace = 'italic',
+                transcriptPointSize = 1.8,
+                colAlpha = 1)  +
+  theme(plot.margin = unit(c(1,8,2,1),"lines"), panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.line = element_line(size=0.5)) +
+  coord_cartesian(clip="off") +
+  annotation_custom(textGrob("Less Expression \nin Testosterone Treated"), xmin=-4, xmax=-4, ymin=-4, ymax=-4) +
+  annotation_custom(textGrob("Greater Expression \nin Testosterone Treated"), xmin=1.3, xmax=1.3, ymin=-4, ymax=-4)
+
+vol_gc
+ggsave(vol_gc, file=file.path(res,'figure3A_volcano_GC.svg'), height=5, width=7)
+
+
+shrink_treat_gc <- shrink_treat_gc[order(shrink_treat_gc$padj),]
+write.csv(shrink_treat_gc,file.path(save.dir,"DE genes testosterone GC.csv"))
+
+# some counts of thresholds
+table(shrink_treat_gc$padj<0.05)
+table(abs(shrink_treat_gc$log2FoldChange)>1)
+table(abs(shrink_treat_gc$log2FoldChange)>1 & shrink_treat_gc$padj<0.05)
+
+head(shrink_treat_gc)
+head(shrink_treat_gc[order(-abs(shrink_treat_gc$log2FoldChange)),])
+
+#mean per treat
+shrink_treat_gc <- read.csv(file.path(res,"DE genes testosterone GC.csv"), row.names=1)
+counts <- counts(treat_gc_fit, normalized=T)
+meta <- colData(treat_gc_fit)
+identical(colnames(counts),rownames(meta))
+baseMean_C_GC <- rowMeans(counts[,meta$group=='C_GC'])
+baseMean_T_GC <- rowMeans(counts[,meta$group=='T_GC'])
+
+shrink_treat_gc$baseMean_C <- baseMean_C_GC[rownames(shrink_treat_gc)] 
+shrink_treat_gc$baseMean_T <- baseMean_T_GC[rownames(shrink_treat_gc)] 
+
+shrink_treat_gc <- shrink_treat_gc[,c(6,7,2:5)]
+write.csv(shrink_treat_gc,file.path(res,"DE genes testosterone GC.csv"))
+
+
+```
+
+
+
+```{r t_tc}
+
+#set up object for model
+reorder <- deseq.ds
+reorder$group <- relevel(reorder$group,'C_TC')
+
+#fit model
+treat_tc_fit <- DESeq(reorder)
+
+#what are coefficient names
+resultsNames(treat_tc_fit)
+
+#get results
+treat_tc_res <- results(treat_tc_fit, name="group_T_TC_vs_C_TC")
+head(treat_tc_res)
+
+#filtered for any reason
+table(is.na(treat_tc_res$padj)) 
+
+#all sample count zero
+table(treat_tc_res$baseMean==0) 
+
+#independent filtering for low normalized mean counts
+table(!is.na(treat_tc_res$pvalue) & is.na(treat_tc_res$padj)) 
+
+#count outlier by Cook's distance
+table(!is.na(treat_tc_res$log2FoldChange) & is.na(treat_tc_res$pvalue) & is.na(treat_tc_res$padj)) 
+
+#shrinkage and volcano plot
+shrink_treat_tc <- lfcShrink(treat_tc_fit, coef="group_T_TC_vs_C_TC", res=treat_tc_res, type='apeglm')
+shrink_treat_tc <- shrink_treat_tc[!is.na(shrink_treat_tc$padj),]
+vol_tc <- EnhancedVolcano(shrink_treat_tc, 
+                title='',
+                subtitle='',
+                caption='',
+                titleLabSize = 0,
+                subtitleLabSize = 0,
+                captionLabSize = 0,
+                lab=rownames(shrink_treat_tc), 
+                selectLab=c('LOC114117342','ELMOD1','LOC105603132','RET'),
+                x='log2FoldChange',
+                y='padj',
+                ylab = bquote(~-Log[10]~adjusted~italic(P)),
+                #xlim = c(-4.5,6.0),
+                ylim = c(0,3),
+                legendVisible = F,
+                pCutoff=0.05,
+                #FCcutoff=2.5,
+                transcriptLabSize = 3.5,
+                transcriptLabvjust = c(-0.7,-0.5,-0.7,1.7),
+                #drawConnectors = TRUE,
+                transcriptLabFace = 'italic',
+                transcriptPointSize = 1.8,
+                colAlpha = 1) +
+  theme(plot.margin = unit(c(1,8,2,1),"lines"), panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        axis.line = element_line(size=0.5)) +
+  coord_cartesian(clip="off") +
+  annotation_custom(textGrob("Less Expression \nin Testosterone Treated"), xmin=-1, xmax=-1, ymin=-1.2, ymax=-1.2) +
+  annotation_custom(textGrob("Greater Expression \nin Testosterone Treated"), xmin=1.8, xmax=1.8, ymin=-1.2, ymax=-1.2)
+
+vol_tc
+ggsave(vol_tc, file=file.path(res,'figure3B_volcano_TC.svg'), height=5, width=7)
+
+
+shrink_treat_tc <- shrink_treat_tc[order(shrink_treat_tc$padj),]
+write.csv(shrink_treat_tc,file.path(save.dir,"DE genes testosterone TC.csv"))
+
+# some counts of thresholds
+table(shrink_treat_tc$padj<0.05)
+table(abs(shrink_treat_tc$log2FoldChange)>1)
+table(abs(shrink_treat_tc$log2FoldChange)>1 & shrink_treat_tc$padj<0.05)
+
+head(shrink_treat_tc)
+head(shrink_treat_tc[order(-abs(shrink_treat_tc$log2FoldChange)),])
+
+#mean per treat
+shrink_treat_tc <- read.csv(file.path(res,"DE genes testosterone TC.csv"), row.names=1)
+counts <- counts(treat_tc_fit, normalized=T)
+meta <- colData(treat_tc_fit)
+identical(colnames(counts),rownames(meta))
+baseMean_C_TC <- rowMeans(counts[,meta$group=='C_TC'])
+baseMean_T_TC <- rowMeans(counts[,meta$group=='T_TC'])
+
+shrink_treat_tc$baseMean_C <- baseMean_C_TC[rownames(shrink_treat_tc)] 
+shrink_treat_tc$baseMean_T <- baseMean_T_TC[rownames(shrink_treat_tc)] 
+
+shrink_treat_tc <- shrink_treat_tc[,c(6,7,2:5)]
+write.csv(shrink_treat_tc,file.path(res,"DE genes testosterone TC.csv"))
+
+```
+
+
+
+## Expression heatmap
+```{r exp_heat}
+library(psycho)
+library(gplots)
+
+if(REMOVE) {
+  res <- "C:/Users/John/Google Drive/Misc/RNAseq/Sheep_RNAseq/Sheep_Ov/Results/Outlier Removed"
+}else{
+  res <- "C:/Users/John/Google Drive/Misc/RNAseq/Sheep_RNAseq/Sheep_Ov/Results/With Outlier"
+}
+
+#load DE genes results
+de.type <- read.csv(file.path(res,'DE genes cell controls.csv'),header=T,row.names="X")
+de.gc <- read.csv(file.path(res,'DE genes testosterone GC.csv'),header=T,row.names="X")
+de.tc <- read.csv(file.path(res,'DE genes testosterone TC.csv'),header=T,row.names="X")
+
+#get top genes
+top.cell <- rownames(de.type[de.type$padj<0.05,])
+top.gc <-  rownames(de.gc[de.gc$padj<0.05,])
+top.tc <-  rownames(de.tc[de.tc$padj<0.05,])
+
+
+counts <- counts(deseq.ds)
+
+#top DE by T in GC
+counts.top <- counts[,deseq.ds$tissue=="GC"]
+coln <- colnames(counts.top)
+counts.top <- counts.top[rownames(de.gc)[1:200],] %>% t() %>% data.frame() %>% standardize() %>% t()
+colnames(counts.top) <- coln
+
+labs <- ifelse(colData(deseq.ds)[colnames(counts.top),"group"]=='C_GC', 'Control', 'Testosterone')
+col.hc <- hclust(dist(t(counts.top)))
+col.dd <- as.dendrogram(col.hc)
+weights.dd <- ifelse(colData(deseq.ds)[colnames(counts.top),"group"]=='C_GC', 1, 1000)
+col.dd.reorder <- reorder(col.dd, wts=weights.dd, agglo.FUN=mean)
+heatmap.2(counts.top, labCol=labs, trace="none", density.info="none", dendrogram="column",
+          Colv=col.dd.reorder, col=colorRampPalette(c("blue","white","red"))(128))
+grid.echo()
+gc.hm <- grid.grab()
+
+#top DE by T in TC
+counts.top <- counts[,deseq.ds$tissue=="TC"]
+coln <- colnames(counts.top)
+counts.top <- counts.top[rownames(de.tc)[1:200],] %>% t() %>% data.frame() %>% standardize() %>% t()
+colnames(counts.top) <- coln
+
+labs <- ifelse(colData(deseq.ds)[colnames(counts.top),"group"]=='C_TC', 'Control', 'Testosterone')
+heatmap.2(counts.top, labCol=labs, trace="none", density.info="none", dendrogram="column",
+          col=colorRampPalette(c("blue","white","red"))(128), key=FALSE, lwid=c(0.1,4))
+grid.echo()
+tc.hm <- grid.grab()
+
+#apply letter lables
+sfig_samp_heat <- list(gc.hm, tc.hm)
+sfig_samp_heat_label <- list("A.", "B.")
+sfig_samp_heat <- lapply(1:length(sfig_samp_heat), FUN = function(i){
+  arrangeGrob(sfig_samp_heat[[i]], top = textGrob(sfig_samp_heat_label[[i]], x= unit(0, "npc")
+                                ,y= unit(1, "npc"), just= c("left","top"),
+                                gp=gpar(col="black", fontsize=18)))
+})
+
+
+tiff(file.path(res,"heatmap_samples_2pannel.tif"), height=8, width=16, units='in', res=300)
+grid.arrange(sfig_samp_heat[[1]], sfig_samp_heat[[2]], widths=c(1.75,0.3,1.25), 
+             padding=0, clip=TRUE,
+             layout_matrix=rbind(c(1,3,2)))
+dev.off()
+
+grid.arrange(gc.hm)
+
+```
+
+
+#Plotting normalized counts of some genes of interest
+
+```{r plotcount}
+plot_gene <- function(gene, samps, breaks, ylim){
+  counts <- plotCounts(samps, gene=gene, intgroup='tissue', returnData=T)
+  ggplot(data=counts, aes(x=tissue, y=count)) +
+    geom_point(size=6.0, shape=1, stroke=1.7, position=position_jitter(w=0.12,h=0,seed=1776)) +
+    geom_errorbar(stat="summary", fun.y="mean", width=0.6,
+              aes(ymax=..y.., ymin=..y..)) +
+    ylab("Normalized Count") +
+    ggtitle(gene) +
+    #coord_trans(y="log2", ylim=ylim) +
+    theme_bw() +
+    theme(axis.title.x=element_blank(),
+          axis.text.x=element_text(face="bold",size=30),
+          axis.text.y=element_text(size=25),
+          axis.title.y=element_text(face="bold",size=30),
+          plot.title=element_text(face="bold",size=40, hjust=0.5),
+          panel.grid.minor=element_blank()) +
+    scale_y_continuous(breaks=breaks, labels=breaks, limits=ylim)
+}
+
+
+comp_tissue$tissue <- ifelse(comp_tissue$tissue=='GC', 'Granulosa', 'Theca')
+comp_tissue$tissue <- factor(comp_tissue$tissue)
+
+
+p.cyp19 <- plot_gene("CYP19", comp_tissue , breaks=c(0,200,600,1000,2000), ylim=c(0.3,2200))
+p.cyp17 <- plot_gene("CYP17A1", comp_tissue , breaks=c(0,200,400,800,600, 1000,1200), ylim=c(0.3,1300))
+
+ggsave(file=file.path(res,'counts_CYP19.svg'), plot=p.cyp19, height=7, width=10)
+ggsave(file=file.path(res,'counts_CYP17A1.svg'), plot=p.cyp17, height=7, width=10)
+
+pdf(file.path(res,'counts_plots.pdf'), height=7, width=10)
+p.cyp19
+p.cyp17
+dev.off()
+
+
+counts.cyp19 <- plotCounts(comp_tissue, gene="CYP19", intgroup='tissue', returnData=T)
+counts.cyp17 <- plotCounts(comp_tissue, gene="CYP17A1", intgroup='tissue', returnData=T)
+write.csv(counts.cyp19, file=file.path(res,'counts_CYP19.csv'))
+write.csv(counts.cyp17, file=file.path(res,'counts_CYP17A1.csv'))
+
+```
+
+
+## Compare results across contrasts
+```{r venn}
+library(eulerr)
+
+if(REMOVE) {
+  #res <- "C:/Users/John/Google Drive/Misc/RNAseq/Sheep_RNAseq/Sheep_Ov/Results/Outlier Removed"
+  res <- "F:/Drive/Misc/RNAseq/Sheep_RNAseq/Sheep_Ov/Results/Outlier Removed"
+}else{
+  res <- "C:/Users/John/Google Drive/Misc/RNAseq/Sheep_RNAseq/Sheep_Ov/Results/With Outlier"
+  #res <- "F:/Drive/Misc/RNAseq/Sheep_RNAseq/Sheep_Ov/Results/With Outlier"
+}
+
+
+#load DE genes results
+de.type <- read.csv(file.path(res,'DE genes cell controls.csv'),header=T, row.names=1)
+de.cellT <- read.csv(file.path(res,'DE genes cell prenatalT.csv'), header=T, row.names=1)
+de.gc <- read.csv(file.path(res,'DE genes testosterone GC.csv'),header=T,row.names="X")
+de.tc <- read.csv(file.path(res,'DE genes testosterone TC.csv'),header=T,row.names="X")
+
+#get top genes
+top.cellT <- rownames(de.cellT[de.cellT$padj<0.05 & abs(de.cellT$log2FoldChange)>1,])
+top.cell <- rownames(de.type[de.type$padj<0.05 & abs(de.type$log2FoldChange)>1,])
+top.gc <-  rownames(de.gc[de.gc$padj<0.05,])
+top.tc <-  rownames(de.tc[de.tc$padj<0.05,])
+
+# top.cell <- rownames(de.type[de.type$pvalue<1e-3,])
+# top.gc <-  rownames(de.gc[de.gc$pvalue<1e-3,])
+# top.tc <-  rownames(de.tc[de.tc$pvalue<1e-3,])
+
+#get tables of top ordered by logFC
+tab.cell <- de.type[top.cell,]
+tab.gc <- de.gc[top.gc,]
+tab.tc <- de.tc[top.tc,]
+
+tab.cell <- tab.cell[order(-abs(tab.cell$log2FoldChange)),]
+tab.gc <- tab.gc[order(-abs(tab.gc$log2FoldChange)),]
+tab.tc <- tab.tc[order(-abs(tab.tc$log2FoldChange)),]
+
+tab.cell[rownames(tab.cell) %in% c("CYP19","CYP17"),]
+
+tab.cell.small <- tab.cell[tab.cell$padj<1e-15]
+tab.cell.tiny <- tab.cell[tab.cell$padj<1e-100,]
+
+de_fmt <- function(tab){
+  tab[,1] <- round(tab[,1],2)
+  tab[,2] <- round(tab[,2],2)
+  tab$log2FoldChange <- round(tab$log2FoldChange,2)
+  tab$lfcSE <- round(tab$lfcSE,2)
+  tab$lfcSE <- as.character(signif(tab$lfcSE, 3))
+  tab$pvalue <- as.numeric(formatC(tab$pvalue, format="e", digits=2))
+  tab$padj <- as.numeric(formatC(tab$padj, format="e", digits=2))
+  
+  tab
+}
+
+tab.cell <- de_fmt(tab.cell)
+tab.gc <- de_fmt(tab.gc)
+tab.tc <- de_fmt(tab.tc)
+
+
+write.csv(tab.gc, file=file.path(res,'DE genes testosterone GC (padj05).csv'))
+write.csv(tab.tc, file=file.path(res,'DE genes testosterone TC (padj05).csv'))
+write.csv(tab.cell, file=file.path(res,'DE genes cell (padj05).csv'))
+write.csv(tab.cell.small, file=file.path(res,'DE genes cell (padj_e15).csv'))
+write.csv(tab.cell.tiny, file=file.path(res,'DE genes cell (padj_e100).csv'))
+
+
+write.csv(tab.cell, file=file.path(res,'DE genes cell controls (padj05).csv'))
+
+### venn diagram
+
+
+vnc <- euler(list('Genes in Granulosa \n (Adjusted-P<0.05)'=top.gc, 'Genes in Theca \n (Adjusted-P<0.05)'=top.tc))
+p <- plot(vnc, quantities=T, adjust_lables=T, labels=T)
+p
+
+ggsave(p, file=file.path(res,'Figure4A_venn_diagram.svg'), height=4, width=7)
+
+paste(intersect(top.gc, top.tc), collapse=', ')
+
+
+
+length(top.cell)
+length(top.cellT)
+length(intersect(top.cellT,top.cell))/length(top.cellT)
+# 6308/7611
+# 0.8288
+
+common <- intersect(rownames(de.cellT),rownames(de.type))
+Teff <- de.cellT[common,'log2FoldChange']
+Ceff <- de.type[common,'log2FoldChange']
+
+cor(Teff, Ceff)
+# 0.8842315
+
+```
+
+## Convert to human ortholog genes and prepare the LR path input files
+```{r LRpath}
+library(org.Hs.eg.db)
+
+if(REMOVE) {
+  res <- "C:/Users/John/Google Drive/Misc/RNAseq/Sheep_RNAseq/Sheep_Ov/Results/Outlier Removed"
+}else{
+  res <- "C:/Users/John/Google Drive/Misc/RNAseq/Sheep_RNAseq/Sheep_Ov/Results/With Outlier"
+}
+
+#load human ortholog table
+ortho <- read.table(gsub("Sheep_Ov.*","orthologs.txt",res),sep="\t", header=T, stringsAsFactors = F)
+
+#load DE genes results
+de.type <- read.csv(file.path(res,'DE genes cell controls.csv'),header=T,row.names="X")
+de.gc <- read.csv(file.path(res,'DE genes testosterone GC.csv'),header=T,row.names="X")
+de.tc <- read.csv(file.path(res,'DE genes testosterone TC.csv'),header=T,row.names="X")
+
+
+### write input files for LR path according to instructions for RNAenrich
+
+#TC vs GC
+type.counts <- counts[match(rownames(de.type),rownames(counts)),]
+type.ortho <- ortho[match(rownames(de.type),ortho$Sheep.gene.name),"Gene.name"]
+type.ortho <- unlist(mapIds(org.Hs.eg.db, type.ortho, "ENTREZID", "SYMBOL"))
+type.LR <- data.frame(geneid=type.ortho[match(rownames(de.type),names(type.ortho))],
+                        PValue=de.type$pvalue,
+                        logFC=de.type$log2FoldChange,
+                        norm_avg_readcount=rowMeans(type.counts))
+type.LR <- type.LR[!is.na(type.LR$geneid),]
+write.table(type.LR, sep="\t", row.names=FALSE, quote=FALSE, file=file.path(res,"/LRpath/type_ctrl_LR_input.txt"))
+
+gc.counts <- counts[match(rownames(de.gc),rownames(counts)),]
+gc.ortho <- ortho[match(rownames(de.gc),ortho$Sheep.gene.name),"Gene.name"]
+gc.ortho <- unlist(mapIds(org.Hs.eg.db, gc.ortho, "ENTREZID", "SYMBOL"))
+gc.LR <- data.frame(geneid=gc.ortho[match(rownames(de.gc),names(gc.ortho))],
+                        PValue=de.gc$pvalue,
+                        logFC=de.gc$log2FoldChange,
+                        norm_avg_readcount=rowMeans(gc.counts))
+tc.LR <- tc.LR[!is.na(tc.LR$geneid),]
+write.table(tc.LR, sep="\t", row.names=FALSE, quote=FALSE, file=file.path(res,"/LRpath/tc_LR_input.txt"))
+
+tc.counts <- counts[match(rownames(de.tc),rownames(counts)),]
+tc.ortho <- ortho[match(rownames(de.tc),ortho$Sheep.gene.name),"Gene.name"]
+tc.ortho <- unlist(mapIds(org.Hs.eg.db, tc.ortho, "ENTREZID", "SYMBOL"))
+tc.LR <- data.frame(geneid=tc.ortho[match(rownames(de.tc),names(tc.ortho))],
+                        PValue=de.tc$pvalue,
+                        logFC=de.tc$log2FoldChange,
+                        norm_avg_readcount=rowMeans(tc.counts))
+tc.LR <- tc.LR[!is.na(tc.LR$geneid),]
+write.table(tc.LR, sep="\t", row.names=FALSE, quote=FALSE, file=file.path(res,"/LRpath/tc_LR_input.txt"))
+```
+
+## Clean up of LR path output
+```{r postLR}
+if(REMOVE) {
+  res <- "F:/Drive/Misc/RNAseq/Sheep_RNAseq/Sheep_Ov/Results/Outlier Removed"
+}else{
+  res <- "C:/Users/John/Google Drive/Misc/RNAseq/Sheep_RNAseq/Sheep_Ov/Results/With Outlier"
+}
+
+library(openxlsx)
+
+LR.type <- read.xlsx(file.path(res,"LRpath/celltype_control_LR_results.xlsx"))
+LR.gc <- read.xlsx(file.path(res,"LRpath/gc_LR_results.xlsx"))
+LR.tc <- read.xlsx(file.path(res,"LRpath/tc_LR_results.xlsx"))
+
+sort <- function(LR){
+  LR <- LR[order(LR$"P-Value"),]
+  LR$Z <- qnorm(LR$"P-Value"/2)*-sign(LR$Coeff)
+  colnames(LR) <- c("id", "name", "concept_type", "n_genes", "coeff", "OR", "P", "FDR", "direction", "sig_genes", "Z")
+  LR[,c(1,2,3,4,9,5,6,11,7,8,10)]
+}
+
+LR.type2 <- sort(LR.type)
+LR.gc2 <- sort(LR.gc)
+LR.tc2 <- sort(LR.tc)
+
+write.csv(LR.type, file=file.path(res,"RNA-Enrich celltype.csv"))
+write.csv(LR.gc, file=file.path(res,"RNA-Enrich GC.csv"))
+write.csv(LR.tc, file=file.path(res,"RNA-Enrich TC.csv"))
+```
+
+
+## Compare LRpath results
+```{r compLR}
+if(REMOVE) {
+  res <- "C:/Users/John/Google Drive/Misc/RNAseq/Sheep_RNAseq/Sheep_Ov/Results/Outlier Removed"
+}else{
+  res <- "C:/Users/John/Google Drive/Misc/RNAseq/Sheep_RNAseq/Sheep_Ov/Results/With Outlier"
+}
+
+library(openxlsx)
+
+LR.type <- read.xlsx(file.path(res,"LRpath/celltype_control_LR_results.xlsx"))
+LR.gc <- read.xlsx(file.path(res,"LRpath/gc_LR_results.xlsx"))
+LR.tc <- read.xlsx(file.path(res,"LRpath/tc_LR_results.xlsx"))
+
+
+#get top paths
+LRtop.cell <- LR.type[LR.type$FDR<0.01,]
+LRtop.gc <- LR.gc[LR.gc$FDR<0.01,]
+LRtop.tc <- LR.tc[LR.tc$FDR<0.01,]
+
+nrow(LRtop.cell)
+
+paths <- unique(c(LRtop.gc$Id,LRtop.tc$Id))
+common <- intersect(LRtop.gc$Id,LRtop.tc$Id)
+
+tc_only <- LRtop.tc[!LRtop.tc$name %in% LRtop.gc$name,-10]
+gc_only <- LRtop.gc[!LRtop.gc$name %in% LRtop.tc$name,-10]
+gc_both <- LRtop.gc[LRtop.gc$Id %in% common, ]
+tc_both <- LRtop.tc[LRtop.tc$Id %in% common, ]
+both <- cbind(gc_both[match(gc_both$Id, common), -10],tc_both[match(tc_both$Id, common),5:9])
+colnames(both)[5:9] <- paste0('GC_',colnames(both)[5:9]) 
+colnames(both)[10:14] <- paste0('TC_',colnames(both)[10:14]) 
+write.xlsx(list(both=both, gc_only=gc_only, tc_only=tc_only), file=file.path(res,'pathways_FDR01.xlsx'))
+
+
+table(both$TC_OddsRatio > 1 & both$GC_OddsRatio > 1)
+table(both$TC_OddsRatio < 1 & both$GC_OddsRatio < 1)
+table(both$TC_OddsRatio < 1 & both$GC_OddsRatio > 1)
+table(both$TC_OddsRatio > 1 & both$GC_OddsRatio < 1)
+
+
+construct_mat <- function(path.set){
+  gc_paths <- LR.gc[match(path.set,LR.gc$Id),-which(colnames(LR.gc)=="SigGenes")]
+  tc_paths <- LR.tc[match(path.set,LR.tc$Id),-which(colnames(LR.tc)=="SigGenes")]
+  
+  for_clust <- data.frame(GC=gc_paths$OddsRatio,TC=tc_paths$OddsRatio)
+  for_clust <- as.matrix(for_clust)
+  rownames(for_clust) <- gc_paths$name
+  return(for_clust)
+}
+
+OR_matrix <- construct_mat(paths)
+
+library(gplots)
+
+color.gradient <- colorRampPalette(c('firebrick4','firebrick3','gainsboro','royalblue3','royalblue4'))
+col.breaks <- c(seq(0,1,length=6),seq(1.2,2.1,length=5))
+#col.breaks <- c(0,0.66,1,1.33,2.33,4)
+
+svglite(file.path(res,'heatmap_paths.svg'))
+heatmap.2(OR_matrix
+          ,dendrogram='none'
+          ,density.info='none'
+          ,trace='none'
+          ,col=color.gradient(10)
+          ,breaks=col.breaks
+          ,margins=c(0,0)
+          ,lmat=rbind(c(0,0,4,0),
+                      c(0,5,5,0),
+                      c(3,1,2,0),
+                      c(0,0,0,0))
+          ,lhei=c(0.2,1.2,4,1)
+          ,lwid=c(1,0.5,3,1.2)
+          ,cexCol=2.1
+          ,key.xlab="Enrichment Odds Ratio"
+          ,key.title="OR"
+          ,RowSideColors = ifelse(paths %in% common, "gray60", ifelse(paths %in% LRtop.gc$Id, "gray92", "gray2"))
+          ,labRow=NA
+          ,labCol=c("GC", "TC")
+          ,srtCol=0
+          ,adjCol=c(0.5,0.8)
+          ,sepwidth = c(0,0)
+          ,sepcolor = rgb(0,0,0,0,maxColorValue = 255)
+          )
+par(xpd=TRUE)
+legend(-0.1,0.5, legend=c("GC","Both","TC"),fill=c("gray92","gray60","gray2"), bty='n')
+dev.off()
+
+
+test.hm <- heatmap.2(OR_matrix
+          ,dendrogram='none'
+          ,density.info='none'
+          ,trace='none'
+          ,col=color.gradient(10)
+          ,breaks=col.breaks
+          ,cexCol=2.1
+          ,key.xlab="Enrichment Odds Ratio"
+          ,key.title="OR"
+          ,RowSideColors = ifelse(paths %in% common, "gray50", ifelse(paths %in% LRtop.gc$Id, "gray80", "gray6"))
+          ,labCol=c("GC", "TC")
+          ,srtCol=0
+          ,adjCol=c(0.5,0.8)
+          )
+test.listpaths <- test.hm$carpet
+test.listpaths <- t(test.listpaths)
+test.listpaths <- test.listpaths[nrow(test.listpaths):1,]
+write.csv(test.listpaths, file=file.path(res,'test_heatmap_paths.csv'))
+
+### cell type 
+
+LRtop.cell <- LRtop.cell[!duplicated(LRtop.cell$name), ]
+OR_mat_cell <- data.frame(Tissue=LRtop.cell$OR)
+rownames(OR_mat_cell) <- LRtop.cell$name
+OR_mat_cell <- as.matrix(OR_mat_cell)
+
+color.gradient <- colorRampPalette(c('firebrick4','firebrick3','gainsboro','royalblue3','royalblue4'))
+col.breaks <- c(seq(0,1,length=6),seq(1.2,2.1,length=5))
+
+cell.hm <- heatmap.2(cbind(OR_mat_cell,OR_mat_cell)
+          ,dendrogram='none'
+          ,density.info='none'
+          ,trace='none'
+          ,col=color.gradient(10)
+          ,breaks=col.breaks
+          ,margins=c(0,0)
+          ,lmat=rbind(c(3,4,4,0),c(0,2,1,0),c(0,0,0,0))
+          #,lmat=rbind(c(0,0,4,0),c(0,0,3,0),c(0,2,1,0),c(0,0,0,0))
+          ,lhei=c(1, 2.2, 0.5)
+          ,lwid=c(0.1, 1, 1.8, 10)
+          ,cexCol=2.1
+          ,key.xlab="Enrichment Odds Ratio"
+          ,key.title="OR"
+          ,labRow=""
+          ,labCol=c("Theca vs Granulosa", "")
+          ,srtCol=0
+          ,adjCol=c(0.28,0.8)
+          )
+cell.listpaths <- cell.hm$carpet
+grid.echo()
+cell.hm <- grid.grab()
+
+cell.listpaths <- t(cell.listpaths)
+cell.listpaths <- cell.listpaths[,-2]
+cell.listpaths <- rev(cell.listpaths)
+write.csv(cell.listpaths, file=file.path(res,'cell_heatmap_paths.csv'))
+
+
+```
+
+
+#Network diagram
+```{r network}
+library(STRINGdb)
+library(org.Hs.eg.db)
+library(annotate)
+string_db <- STRINGdb$new(species=9606)
+
+if(REMOVE) {
+  res <- "F:/Drive/Misc/RNAseq/Sheep_RNAseq/Sheep_Ov/Results/Outlier Removed"
+}else{
+  res <- "C:/Users/John/Google Drive/Misc/RNAseq/Sheep_RNAseq/Sheep_Ov/Results/With Outlier"
+}
+
+library(openxlsx)
+
+#load ortholog dataset downloaded from biomart
+ortho <- read.table("../../orthologs.txt",sep="\t", header=T, stringsAsFactors = F)
+
+#load RNA enrich pathways
+LR.type <- read.xlsx(file.path(res,"LRpath/celltype_control_LR_results.xlsx"))
+LR.gc <- read.xlsx(file.path(res,"LRpath/gc_LR_results.xlsx"))
+LR.tc <- read.xlsx(file.path(res,"LRpath/tc_LR_results.xlsx"))
+
+#load DE genes results
+de.gc <- read.csv(file.path(res,'DE genes testosterone GC.csv'),header=T,row.names="X")
+de.tc <- read.csv(file.path(res,'DE genes testosterone TC.csv'),header=T,row.names="X")
+
+
+### mitochondrial matrix (GC)
+gene.gc <- LR.gc[LR.gc$name=="mitochondrial matrix",'SigGenes']
+gene.gc <- unlist(strsplit(gene.gc, ", "))
+gene.gc <- unique(gene.gc)
+gene.gc <- mapIds(org.Hs.eg.db, gene.gc, "SYMBOL", "ENTREZID")
+
+gene.gc.m <- ortho[match(gene.gc,ortho$Gene.name),"Sheep.gene.name"]
+
+gene.gc.m <- unique(gene.gc.m)
+
+gc.gene.df <- data.frame(gene=gene.gc.m)
+gc_map <- string_db$map(gc.gene.df,"gene")
+gc_map <- gc_map[!is.na(gc_map$STRING_id),]
+gc_hits <- gc_map$"STRING_id"
+payload_gc <- string_db$post_payload(gc_hits, colors=ifelse(de.gc[gc_map$gene,'log2FoldChange']>0, "#0392ff", "#ff1100"))
+pdf(file.path(res,'STRINGdb mitochondrial matrix (GC).pdf'))
+  string_db$plot_network(gc_hits, payload_id = payload_gc)
+  string_db$plot_network(gc_hits, required_score = 300, payload_id = payload_gc)
+dev.off()
+
+
+### ribosome biogenesis (TC)
+gene.tc <- LR.tc[LR.tc$name=="ribosome biogenesis",'SigGenes']
+gene.tc <- unlist(strsplit(gene.tc, ", "))
+gene.tc <- unique(gene.tc)
+gene.tc.m <- mapIds(org.Hs.eg.db, gene.tc, "SYMBOL", "ENTREZID")
+
+genes.tc.sym <- unique(gene.tc.m)
+
+tc.gene.df <- data.frame(gene=genes.tc.sym)
+tc_map <- string_db$map(tc.gene.df,"gene")
+tc_map <- tc_map[!is.na(tc_map$STRING_id),]
+tc_hits <- tc_map$"STRING_id"
+payload_tc <- string_db$post_payload(tc_hits, ifelse(de.tc[tc_map$gene,'log2FoldChange']>0, "#0392ff", "#ff1100"))
+pdf(file.path(res,'STRINGdb ribosome biogenesis (TC).pdf'))
+  string_db$plot_network(tc_hits, payload_id = payload_tc)
+  string_db$plot_network(tc_hits, required_score = 300, payload_id = payload_tc)
+dev.off()
+
+
+### extracellular matrix
+gene.gc2 <- LR.gc[LR.gc$name=="extracellular matrix",'SigGenes']
+gene.gc2 <- unlist(strsplit(gene.gc2, ", "))
+gene.gc2 <- unique(gene.gc2)
+gene.gc2 <- mapIds(org.Hs.eg.db, gene.gc2, "SYMBOL", "ENTREZID")
+
+gene.gc2.m <- ortho[match(gene.gc2,ortho$Gene.name),"Sheep.gene.name"]
+
+gene.gc2.m <- unique(gene.gc2.m)
+
+gc2.gene.df <- data.frame(gene=gene.gc2.m)
+gc2_map <- string_db$map(gc2.gene.df,"gene")
+gc2_map <- gc2_map[!is.na(gc2_map$STRING_id),]
+gc2_hits <- gc2_map$"STRING_id"
+payload_gc2 <- string_db$post_payload(gc2_hits, colors=ifelse(de.gc[gc2_map$gene,'log2FoldChange']>0, "#0392ff", "#ff1100"))
+pdf(file.path(res,'STRINGdb extracellular matrix (gc).pdf'))
+  string_db$plot_network(gc2_hits, payload_id = payload_gc2)
+  string_db$plot_network(gc2_hits, required_score = 300, payload_id = payload_gc2)
+dev.off()
+
+
+gene.tc2 <- LR.tc[LR.tc$name=="extracellular matrix",'SigGenes']
+gene.tc2 <- unlist(strsplit(gene.tc2, ", "))
+gene.tc2 <- unique(gene.tc2)
+gene.tc2 <- mapIds(org.Hs.eg.db, gene.tc2, "SYMBOL", "ENTREZID")
+
+gene.tc2.m <- ortho[match(gene.tc2,ortho$Gene.name),"Sheep.gene.name"]
+
+gene.tc2.m <- unique(gene.tc2.m)
+
+tc2.gene.df <- data.frame(gene=gene.tc2.m)
+tc2_map <- string_db$map(tc2.gene.df,"gene")
+tc2_map <- tc2_map[!is.na(tc2_map$STRING_id),]
+tc2_hits <- tc2_map$"STRING_id"
+payload_tc2 <- string_db$post_payload(tc2_hits, colors=ifelse(de.tc[tc2_map$gene,'log2FoldChange']>0, "#0392ff", "#ff1100"))
+pdf(file.path(res,'STRINGdb extracellular matrix (tc).pdf'))
+  string_db$plot_network(tc2_hits, payload_id = payload_tc2)
+  string_db$plot_network(tc2_hits, required_score = 300, payload_id = payload_tc2)
+dev.off()
+
+
+### p < 0.05 
+de.gc2 <- read.table(file.path(res,"/LRpath/gc_LR_input.txt"), header=T)
+de.tc2 <- read.table(file.path(res,"/LRpath/tc_LR_input.txt"), header=T)
+
+tail(de.gc[de.gc$padj<0.05,])
+tail(de.tc[de.tc$padj<0.05,])
+
+top.gc <- de.gc2[de.gc2$PValue<0.000284,'geneid']
+top.tc <- de.tc2[de.tc2$PValue<0.000195,'geneid']
+
+top.gc <- as.character(top.gc)
+top.gc.sym <- mapIds(org.Hs.eg.db, top.gc, "SYMBOL", "ENTREZID")
+
+top.tc <- as.character(top.tc)
+top.tc.sym <- mapIds(org.Hs.eg.db, top.tc, "SYMBOL", "ENTREZID")
+
+topgc.gene.df <- data.frame(gene=top.gc.sym)
+topgc_map <- string_db$map(topgc.gene.df,"gene")
+topgc_map <- topgc_map[!is.na(topgc_map$STRING_id),]
+topgc_hits <- topgc_map$"STRING_id"
+payload_topgc <- string_db$post_payload(topgc_hits, colors=ifelse(de.tc[topgc_map$gene,'log2FoldChange']>0, "#0392ff", "#ff1100"))
+
+toptc.gene.df <- data.frame(gene=top.tc.sym)
+toptc_map <- string_db$map(toptc.gene.df,"gene")
+toptc_map <- toptc_map[!is.na(toptc_map$STRING_id),]
+toptc_hits <- toptc_map$"STRING_id"
+payload_toptc <- string_db$post_payload(toptc_hits, colors=ifelse(de.tc[toptc_map$gene,'log2FoldChange']>0, "#0392ff", "#ff1100"))
+
+pdf(file.path(res,'STRINGdb_FDR_GC.pdf'))
+  string_db$plot_network(topgc_hits, payload_id = payload_topgc)
+  string_db$plot_network(topgc_hits, required_score = 300, payload_id = payload_topgc)
+dev.off()
+
+pdf(file.path(res,'STRINGdb_FDR_TC.pdf'))
+  string_db$plot_network(toptc_hits, payload_id = payload_toptc)
+  string_db$plot_network(toptc_hits, required_score = 300, payload_id = payload_toptc)
+dev.off()
+
+
+
+
+top.overlap <- intersect(de.gc2[de.gc2$PValue<0.01,'geneid'], de.tc2[de.tc2$PValue<0.01,'geneid'])
+top.overlap <- as.character(top.overlap)
+top.overlap.sym <- mapIds(org.Hs.eg.db, top.overlap, "SYMBOL", "ENTREZID")
+
+topoverlap.gene.df <- data.frame(gene=top.overlap.sym, gc=de.gc[top.overlap.sym,]$log2FoldChange, tc=de.tc[top.overlap.sym,]$log2FoldChange)
+topoverlap_map <- string_db$map(topoverlap.gene.df,"gene")
+topoverlap_map <- topoverlap_map[!is.na(topoverlap_map$STRING_id),]
+topoverlap_hits <- topoverlap_map$"STRING_id"
+payload_topoverlap <- string_db$post_payload(topoverlap_hits, 
+                      colors=ifelse(topoverlap_map$gc>0 & topoverlap_map$tc>0, "#0392ff", 
+                             ifelse(topoverlap_map$gc<0 & topoverlap_map$tc<0, "#ff1100",
+                             ifelse(topoverlap_map$gc>0 & topoverlap_map$tc<0, "#E08A43","#31D81C"))))
+
+pdf(file.path(res,'STRINGdb_P01_Both.pdf'))
+  string_db$plot_network(topoverlap_hits, payload_id = payload_topoverlap)
+  string_db$plot_network(topoverlap_hits, required_score = 300, payload_id = payload_topoverlap)
+dev.off()
+
+
+
+
+svg(file.path(res,'legend.svg'))
+plot.new()
+legend('center',legend=c('Increased Expression', 'Decreased Expression'), fill=c("#0392ff", "#ff1100"))
+dev.off()
+
+svg(file.path(res,'legend_both.svg'))
+plot.new()
+legend('center',legend=c('Increased Expression in Both', 'Decreased Expression in Both'), fill=c("#0392ff", "#ff1100"))
+dev.off()
+
+```
+
+
+
+```{r fold}
+tabs <- 'F:/Drive/Misc/RNAseq/Sheep_RNAseq/Sheep_Ov/Results/Outlier Removed'
+manu <- 'F:/Drive/Misc/RNAseq/Sheep_RNAseq/Sheep_Ov/Manuscript'
+
+
+de.cellC <- read.csv(file.path(tabs,'DE genes cell controls.csv'), header=T)
+de.cellT <- read.csv(file.path(tabs,'DE genes cell prenatalT.csv'), header=T)
+de.gc <- read.csv(file.path(tabs,'DE genes testosterone GC.csv'), header=T)
+de.tc <- read.csv(file.path(tabs,'DE genes testosterone TC.csv'), header=T)
+
+fc <- function(tab){
+  tab$Fold.Change.Estimate <- 2^tab$log2FoldChange
+  tab <- tab[,c(1,3,2,8,4,5,6,7)]
+  tab$X <- paste0(' ',tab$X)
+  
+  tab
+}
+
+de.cellC2 <- fc(de.cellC)
+de.cellT2 <- fc(de.cellT)
+de.gc2 <- fc(de.gc)
+de.tc2 <- fc(de.tc)
+
+write.csv(de.cellC2, file.path(manu,'DE genes cell controls.csv'), quote=F, row.names=F)
+write.csv(de.cellT2, file.path(manu,'DE genes cell prenatalT.csv'), quote=F, row.names=F)
+write.csv(de.gc2, file.path(manu,'DE genes testosterone GC.csv'), quote=F, row.names=F)
+write.csv(de.tc2, file.path(manu,'DE genes testosterone TC.csv'), quote=F, row.names=F)
+
+
+rtab <- read.xlsx(file.path(tabs,'../../Table for rebuttal 05142020.xlsx'))
+genes <- rtab[,1]
+genes <- genes[-1]
+C.genes <- de.cellC[match(genes,de.cellC$X),]
+T.genes <- de.cellT[match(genes,de.cellT$X),]
+C.genes$pvalue <- signif(C.genes$pvalue,2)
+T.genes$pvalue <- signif(T.genes$pvalue,2)
+
+write.csv(C.genes, file.path(tabs,'../../C.csv'))
+write.csv(T.genes, file.path(tabs,'../../T.csv'))
+```
+
+```{r table_selected_genes}
+library(openxlsx)
+tabs <- 'F:/Drive/Misc/RNAseq/Sheep_RNAseq/Sheep_Ov/Manuscript'
+
+
+de.gc <- read.csv(file.path(tabs,'Supplemental Table 4 - DE genes testosterone GC.csv'), header=T)
+de.tc <- read.csv(file.path(tabs,'Supplemental Table 6 - DE genes testosterone TC.csv'), header=T)
+
+de.cellc <- read.csv(file.path(tabs,'Supplemental Table 2 - DE genes cell controls.csv'), header=T)
+de.cellt <- shrink_tissue_t #change when
+
+select <- read.xlsx(file.path(tabs,'../Selected genes.xlsx'))
+
+select.gc <- de.gc[match(select$Gene, de.gc$Gene),c('Fold.Change.Estimate','Adjusted.P.Value')]
+select.tc <- de.tc[match(select$Gene, de.tc$Gene),c('Fold.Change.Estimate','Adjusted.P.Value')]
+select.cellc <- de.cellc[match(select$Gene, de.cellc$Gene),c('Fold.Change.Estimate','Adjusted.P.Value')]
+select.cellt <- de.cellt[match(select$Gene, rownames(de.cellt)),c('log2FoldChange','padj')]
+
+select.gc <- signif(select.gc, 4)
+select.tc <- signif(select.tc, 4)
+
+select[,2:3] <- select.gc
+select[,4:5] <- select.tc
+select$Fold.change.GCvsTC.in.control <- signif(select.cellc$Fold.Change.Estimate,4)
+select$Adjusted.P.Value.c <- signif(select.cellc$Adjusted.P.Value,4)
+select$Fold.change.GCvsTC.in.T <- signif(2^select.cellt$log2FoldChange,4)
+select$Adjusted.P.value.t <- signif(select.cellt$padj,4)
+
+write.xlsx(select,file=file.path(tabs,'../Results/Selected genes.xlsx'))
+
+
+
+gene='FSHR'
+# de.gc[de.gc$Gene==gene,c('Fold.Change.Estimate','Adjusted.P.Value')]
+# de.tc[de.tc$Gene==gene,c('Fold.Change.Estimate','Adjusted.P.Value')]
+de.cellc[de.cellc$Gene==gene,c('Fold.Change.Estimate','Adjusted.P.Value')]
+de.cellt[match(gene, rownames(de.cellt)),c('log2FoldChange','padj')]
+
+
+counts[grepl('TNF',rownames(counts)),]
+```
